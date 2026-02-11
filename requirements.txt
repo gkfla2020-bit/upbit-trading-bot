@@ -1,0 +1,7 @@
+pyupbit
+anthropic
+pandas
+numpy
+python-dotenv
+schedule
+requests
