@@ -341,15 +341,23 @@ class TradingBot:
             total_invested_pct = self._get_total_invested_pct()
             logger.info(f"Portfolio: {portfolio_summary} | Invested: {total_invested_pct:.1f}%")
 
+            cycle_results = []  # 사이클 결과 수집
+
             for ticker in TICKERS:
                 try:
-                    self._process_ticker(ticker, portfolio_summary, total_invested_pct)
+                    result = self._process_ticker(ticker, portfolio_summary, total_invested_pct)
+                    if result:
+                        cycle_results.append(result)
                 except Exception as e:
                     logger.error(f"{ticker} error: {e}")
                 time.sleep(1)  # API rate limit
 
+            # 사이클 종료 후 종합 운용보고서 발송
+            self._send_portfolio_report(cycle_results, total_invested_pct)
+
         except Exception as e:
             logger.error(f"Cycle error: {e}", exc_info=True)
+
 
     def _process_ticker(self, ticker, portfolio_summary, total_invested_pct):
         logger.info(f"--- {ticker} ---")
@@ -366,15 +374,15 @@ class TradingBot:
             if price <= stp["sl"]:
                 logger.info(f"  STOP-LOSS: {price:,.0f} <= {stp['sl']:,.0f}")
                 self.trader.sell(ticker, bal["coin_qty"])
-                self._log(ticker, "sell_sl", bal["coin_qty"], price, {"reason": "stop-loss"})
+                self._log(ticker, "sell_sl", bal["coin_qty"], price, {"reason": "stop-loss"}, None)
                 del self.sl_tp[ticker]
-                return
+                return {"ticker": ticker, "price": price, "action": "sell_sl", "analysis": None, "risk": None, "bal": bal}
             if price >= stp["tp"]:
                 logger.info(f"  TAKE-PROFIT: {price:,.0f} >= {stp['tp']:,.0f}")
                 self.trader.sell(ticker, bal["coin_qty"])
-                self._log(ticker, "sell_tp", bal["coin_qty"], price, {"reason": "take-profit"})
+                self._log(ticker, "sell_tp", bal["coin_qty"], price, {"reason": "take-profit"}, None)
                 del self.sl_tp[ticker]
-                return
+                return {"ticker": ticker, "price": price, "action": "sell_tp", "analysis": None, "risk": None, "bal": bal}
 
         # Multi-agent pipeline
         analysis = agent_analyst(df, ticker)
@@ -395,7 +403,7 @@ class TradingBot:
                     "tp": price * (1 + tp / 100),
                 }
                 logger.info(f"  SL={self.sl_tp[ticker]['sl']:,.0f} TP={self.sl_tp[ticker]['tp']:,.0f}")
-                self._log(ticker, "buy", amt, price, risk_dec)
+                self._log(ticker, "buy", amt, price, risk_dec, analysis)
             else:
                 logger.info(f"  Insufficient: {amt:,.0f} KRW")
         elif final == "sell":
@@ -403,7 +411,7 @@ class TradingBot:
             qty = bal["coin_qty"] * sr
             if qty > 0:
                 self.trader.sell(ticker, qty)
-                self._log(ticker, "sell", qty, price, risk_dec)
+                self._log(ticker, "sell", qty, price, risk_dec, analysis)
                 if sr >= 1.0 and ticker in self.sl_tp:
                     del self.sl_tp[ticker]
             else:
@@ -411,43 +419,260 @@ class TradingBot:
         else:
             logger.info(f"  HOLD")
 
-    def _log(self, ticker, action, amount, price, details):
+        return {
+            "ticker": ticker, "price": price, "action": final,
+            "analysis": analysis, "risk": risk_dec, "bal": bal,
+            "trade": trade_dec,
+        }
+
+    def _log(self, ticker, action, amount, price, details, analysis):
         entry = {"time": datetime.now().isoformat(), "ticker": ticker,
                  "action": action, "amount": amount, "price": price, "details": details}
         self.trade_log.append(entry)
         with open("trade_history.json", "w", encoding="utf-8") as f:
             json.dump(self.trade_log, f, ensure_ascii=False, indent=2)
 
-        # Telegram
-        now = datetime.now().strftime("%m/%d %H:%M")
+        now = datetime.now().strftime("%Y.%m.%d %H:%M")
         coin = ticker.split("-")[1]
-        icons = {"buy": "🟢 매수", "sell": "🔴 매도", "sell_sl": "🛑 손절", "sell_tp": "🎯 익절"}
-        label = icons.get(action, action)
+        icons = {"buy": "🟢", "sell": "🔴", "sell_sl": "🛑", "sell_tp": "🎯"}
+        labels = {"buy": "매수 체결", "sell": "매도 체결", "sell_sl": "손절 체결", "sell_tp": "익절 체결"}
+        icon = icons.get(action, "📌")
+        label = labels.get(action, action)
 
-        if "buy" in action and action == "buy":
+        # 트렌드 이모지
+        trend = analysis.get("trend", "sideways") if analysis else "N/A"
+        trend_str_val = analysis.get("trend_strength", 0) if analysis else 0
+        trend_icons = {"bullish": "📈", "bearish": "📉", "sideways": "➡️"}
+        trend_icon = trend_icons.get(trend, "➡️")
+
+        # 시그널 요약
+        signals = analysis.get("key_signals", []) if analysis else []
+        sig_str = " / ".join(signals[:3]) if signals else "없음"
+
+        # 리스크 정보
+        risk_score = details.get("risk", 0) if isinstance(details, dict) else 0
+        risk_bar = "🟩" * (10 - risk_score) + "🟥" * risk_score
+        conf = details.get("confidence", 0) if isinstance(details, dict) else 0
+
+        bal = self.trader.get_balance_info(ticker)
+        total = bal["krw"] + bal["coin_value"]
+
+        if action == "buy":
             stp = self.sl_tp.get(ticker, {})
             sl_str = f"{stp.get('sl',0):,.0f}" if stp else "?"
             tp_str = f"{stp.get('tp',0):,.0f}" if stp else "?"
+            sl_pct = details.get("stop_loss_pct", 0) if isinstance(details, dict) else 0
+            tp_pct = details.get("take_profit_pct", 0) if isinstance(details, dict) else 0
+            ratio = details.get("size_ratio", 0) if isinstance(details, dict) else 0
+
             msg = (
-                f"<b>{label} {coin}</b> | {now}\n"
-                f"현재가: {price:,.0f}원\n"
-                f"투자금: {amount:,.0f}원\n"
-                f"손절: {sl_str}원 / 익절: {tp_str}원"
+                f"{icon} <b>━━━ 매매 체결 보고서 ━━━</b>\n"
+                f"\n"
+                f"📋 <b>{label} | {coin}</b>\n"
+                f"🕐 {now}\n"
+                f"\n"
+                f"{'─' * 28}\n"
+                f"💰 <b>체결 정보</b>\n"
+                f"{'─' * 28}\n"
+                f"  현재가: <b>{price:,.0f}</b>원\n"
+                f"  투자금: <b>{amount:,.0f}</b>원\n"
+                f"  비중: 보유현금의 {ratio*100:.0f}%\n"
+                f"\n"
+                f"{'─' * 28}\n"
+                f"🛡️ <b>리스크 관리</b>\n"
+                f"{'─' * 28}\n"
+                f"  손절가: {sl_str}원 (-{sl_pct}%)\n"
+                f"  익절가: {tp_str}원 (+{tp_pct}%)\n"
+                f"  리스크: {risk_bar} {risk_score}/10\n"
+                f"\n"
+                f"{'─' * 28}\n"
+                f"📊 <b>AI 분석 근거</b>\n"
+                f"{'─' * 28}\n"
+                f"  추세: {trend_icon} {trend} (강도 {trend_str_val}/10)\n"
+                f"  신호: {sig_str}\n"
+                f"  확신도: {conf}%\n"
+                f"\n"
+                f"{'─' * 28}\n"
+                f"💼 <b>잔고 현황</b>\n"
+                f"{'─' * 28}\n"
+                f"  보유 KRW: {bal['krw']:,.0f}원\n"
+                f"  총 자산: {total:,.0f}원\n"
             )
         else:
-            reason = details.get("reason", details.get("override", ""))
+            reason = ""
+            if isinstance(details, dict):
+                reason = details.get("reason", details.get("override", details.get("reason", "")))
+            pnl = ((price / bal["avg_price"] - 1) * 100) if bal["avg_price"] > 0 else 0
+            pnl_icon = "📈" if pnl >= 0 else "📉"
+
             msg = (
-                f"<b>{label} {coin}</b> | {now}\n"
-                f"현재가: {price:,.0f}원\n"
-                f"수량: {amount}\n"
-                f"사유: {reason}"
+                f"{icon} <b>━━━ 매매 체결 보고서 ━━━</b>\n"
+                f"\n"
+                f"📋 <b>{label} | {coin}</b>\n"
+                f"🕐 {now}\n"
+                f"\n"
+                f"{'─' * 28}\n"
+                f"💰 <b>체결 정보</b>\n"
+                f"{'─' * 28}\n"
+                f"  현재가: <b>{price:,.0f}</b>원\n"
+                f"  매도 수량: {amount}\n"
+                f"  {pnl_icon} 수익률: <b>{pnl:+.2f}%</b>\n"
+                f"\n"
+                f"{'─' * 28}\n"
+                f"📊 <b>AI 분석 근거</b>\n"
+                f"{'─' * 28}\n"
+                f"  추세: {trend_icon} {trend} (강도 {trend_str_val}/10)\n"
+                f"  신호: {sig_str}\n"
+                f"  사유: {reason}\n"
+                f"  리스크: {risk_bar} {risk_score}/10\n"
+                f"\n"
+                f"{'─' * 28}\n"
+                f"💼 <b>잔고 현황</b>\n"
+                f"{'─' * 28}\n"
+                f"  보유 KRW: {bal['krw']:,.0f}원\n"
+                f"  총 자산: {total:,.0f}원\n"
             )
         send_telegram(msg)
+
+    def _send_portfolio_report(self, cycle_results, total_invested_pct):
+        """사이클 종료 후 종합 운용보고서 텔레그램 발송"""
+        now = datetime.now().strftime("%Y.%m.%d %H:%M")
+        total_assets = self.trader.get_total_assets(TICKERS)
+        krw_bal = self.trader.get_balance_info(TICKERS[0])["krw"]
+
+        # 코인별 현황 수집
+        coin_lines = []
+        total_coin_value = 0
+        actions_taken = []
+
+        for r in cycle_results:
+            if not r:
+                continue
+            ticker = r["ticker"]
+            coin = ticker.split("-")[1]
+            price = r["price"]
+            action = r["action"]
+            bal = r.get("bal", {})
+            analysis = r.get("analysis")
+            trade = r.get("trade")
+
+            coin_value = bal.get("coin_value", 0)
+            total_coin_value += coin_value
+
+            # 추세 이모지
+            trend = analysis.get("trend", "?") if analysis else "?"
+            trend_icons = {"bullish": "📈", "bearish": "📉", "sideways": "➡️"}
+            t_icon = trend_icons.get(trend, "❓")
+
+            # 결정 이모지
+            act_icons = {"buy": "🟢매수", "sell": "🔴매도", "hold": "⏸홀드",
+                         "sell_sl": "🛑손절", "sell_tp": "🎯익절"}
+            act_str = act_icons.get(action, action)
+
+            # 보유 여부
+            if bal.get("coin_qty", 0) > 0 and bal.get("avg_price", 0) > 0:
+                pnl = ((price / bal["avg_price"] - 1) * 100)
+                pnl_str = f"{pnl:+.1f}%"
+                hold_str = f"💎 보유중 ({pnl_str})"
+            else:
+                hold_str = "🔲 미보유"
+
+            # 신뢰도
+            conf = ""
+            if trade:
+                conf = f" | 확신 {trade.get('confidence', '?')}%"
+
+            coin_lines.append(
+                f"  {coin:>5} | {price:>12,.0f}원 | {t_icon}{trend:>8} | {act_str}{conf}\n"
+                f"         {hold_str}"
+            )
+
+            if action != "hold":
+                actions_taken.append(f"{act_str} {coin}")
+
+        # 투자 비율 바
+        inv_pct = total_invested_pct
+        bar_filled = int(inv_pct / 5)
+        bar_empty = 20 - bar_filled
+        inv_bar = "▓" * bar_filled + "░" * bar_empty
+
+        # 액션 요약
+        if actions_taken:
+            action_summary = " / ".join(actions_taken)
+        else:
+            action_summary = "전 종목 홀드 (관망)"
+
+        msg = (
+            f"📊 <b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"    <b>투자 운용 보고서</b>\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"🕐 {now} | 주기: {TRADE_INTERVAL_MIN}분\n"
+            f"\n"
+            f"{'─' * 28}\n"
+            f"💼 <b>포트폴리오 총괄</b>\n"
+            f"{'─' * 28}\n"
+            f"  총 자산: <b>{total_assets:,.0f}</b>원\n"
+            f"  보유 현금: {krw_bal:,.0f}원\n"
+            f"  투자 평가액: {total_coin_value:,.0f}원\n"
+            f"  투자 비율: [{inv_bar}] {inv_pct:.1f}%\n"
+            f"\n"
+            f"{'─' * 28}\n"
+            f"🪙 <b>종목별 분석 현황</b>\n"
+            f"{'─' * 28}\n"
+        )
+
+        for line in coin_lines:
+            msg += f"{line}\n"
+
+        msg += (
+            f"\n"
+            f"{'─' * 28}\n"
+            f"⚡ <b>이번 사이클 액션</b>\n"
+            f"{'─' * 28}\n"
+            f"  {action_summary}\n"
+            f"\n"
+            f"{'─' * 28}\n"
+            f"🤖 <b>시스템 상태</b>\n"
+            f"{'─' * 28}\n"
+            f"  모델: {MODEL_SONNET}\n"
+            f"  모니터링: {len(TICKERS)}개 종목\n"
+            f"  다음 분석: {TRADE_INTERVAL_MIN}분 후\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>"
+        )
+
+        send_telegram(msg)
+        logger.info("Portfolio report sent to Telegram")
 
     def start(self):
         coins = ", ".join(t.split("-")[1] for t in TICKERS)
         logger.info(f"Every {TRADE_INTERVAL_MIN}min | {coins} | Analyst->Trader->Risk")
-        send_telegram(f"🤖 봇 시작\n코인: {coins}\n간격: {TRADE_INTERVAL_MIN}분")
+        now = datetime.now().strftime("%Y.%m.%d %H:%M")
+        start_msg = (
+            f"🤖 <b>━━━ 트레이딩 봇 가동 ━━━</b>\n"
+            f"\n"
+            f"🕐 {now}\n"
+            f"📡 상태: <b>ONLINE</b>\n"
+            f"\n"
+            f"{'─' * 28}\n"
+            f"⚙️ <b>운용 설정</b>\n"
+            f"{'─' * 28}\n"
+            f"  모니터링: {coins}\n"
+            f"  분석 주기: {TRADE_INTERVAL_MIN}분\n"
+            f"  캔들: {INTERVAL} × {CANDLE_COUNT}개\n"
+            f"  AI 모델: {MODEL_SONNET}\n"
+            f"  에이전트: 분석가 → 트레이더 → 리스크\n"
+            f"\n"
+            f"{'─' * 28}\n"
+            f"🛡️ <b>리스크 정책</b>\n"
+            f"{'─' * 28}\n"
+            f"  최대 손실/건: 2%\n"
+            f"  종목당 최대 비중: 30%\n"
+            f"  총 투자 한도: 80%\n"
+            f"  자동 손절/익절: ✅\n"
+            f"\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>"
+        )
+        send_telegram(start_msg)
         self.run_once()
         schedule.every(TRADE_INTERVAL_MIN).minutes.do(self.run_once)
         while True:
